@@ -100,7 +100,7 @@ class NextcloudDAV(
                                         displayName =
                                             it.propstat.prop.displayname
                                                 .toString(),
-                                        file = URI("https://nextcloud.sebastianyue.ddns.net" + it.href.toString()),
+                                        file = URI(baseUrl + it.href.toString()),
                                         lastModified =
                                             ZonedDateTime
                                                 .parse(

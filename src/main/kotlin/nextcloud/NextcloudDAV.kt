@@ -1,35 +1,28 @@
-package org.example
+package org.example.nextcloud
 
-import kotlinx.coroutines.*
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import kotlinx.serialization.decodeFromString
-import nl.adaptivity.xmlutil.XmlDeclMode
-import nl.adaptivity.xmlutil.core.XmlVersion
-import nl.adaptivity.xmlutil.serialization.XML
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Credentials
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import org.example.xml.propfind.MultiStatus
+import org.example.file.RemoteFile
+import org.example.file.localPathToRemote
+import org.example.file.remoteToLocalPath
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
-import java.net.URI
 import java.time.ZonedDateTime
-import java.time.format.DateTimeFormatter
-
-data class FileProp(
-    val file: URI,
-    val displayName: String,
-    val lastModified: ZonedDateTime?,
-)
-
-fun splitUriPath(uri: URI): List<String> = uri.path.split("/").filter { it.isNotEmpty() }
+import kotlin.collections.forEach
 
 class NextcloudDAV(
     private val baseUrl: String,
@@ -41,7 +34,7 @@ class NextcloudDAV(
     private val remoteUrl = "$baseUrl/remote.php/dav/files/$username"
 
     private val client = OkHttpClient()
-    private val remoteFiles: MutableList<FileProp> = mutableListOf()
+    private val remoteFiles: MutableList<RemoteFile> = mutableListOf()
     private val semaphore = Semaphore(10)
 
     fun getRemoteFileList() {
@@ -84,35 +77,11 @@ class NextcloudDAV(
                 ) {
                     val responseBody = response.body?.string()
                     if (response.isSuccessful && responseBody != null) {
-                        val format =
-                            XML {
-                                xmlVersion = XmlVersion.XML10
-                                xmlDeclMode = XmlDeclMode.Charset
-                                indentString = "    "
-                            }
-
-                        val multistatus = format.decodeFromString<MultiStatus>(responseBody)
-
-                        multistatus.response.forEach {
-                            if (it.propstat.prop.getlastmodified != null) {
-                                val newFile =
-                                    FileProp(
-                                        displayName =
-                                            it.propstat.prop.displayname
-                                                .toString(),
-                                        file = URI(baseUrl + it.href.toString()),
-                                        lastModified =
-                                            ZonedDateTime
-                                                .parse(
-                                                    // text =
-                                                    it.propstat.prop.getlastmodified
-                                                        .toString(),
-                                                    DateTimeFormatter.RFC_1123_DATE_TIME,
-                                                ),
-                                    )
-                                remoteFiles.add(newFile)
-                            }
-                        }
+                        deserializePropFindReq(
+                            url = baseUrl,
+                            xmlBody = responseBody,
+                            remoteFileList = remoteFiles,
+                        )
                     } else {
                         println("Error: ${response.code}")
                     }
@@ -122,32 +91,99 @@ class NextcloudDAV(
         )
     }
 
-    fun sync() =
+    fun sync() {
+        download()
+        upload()
+    }
+
+    fun download() =
         runBlocking {
             val jobs =
-                remoteFiles.map { fileProp ->
+                remoteFiles.map<RemoteFile, Job> { remoteFile ->
                     launch {
-                        val fileUrl = fileProp.file
-
-                        val uriList = splitUriPath(fileUrl)
-                        val localFilePath = localPath + "/" + uriList.subList(4, uriList.size).joinToString("/")
-                        val filePath = File(localFilePath)
-                        if (fileProp.lastModified != null) {
-                            if (filePath.lastModified() > fileProp.lastModified.toInstant().toEpochMilli()) {
-                                downloadRemoteFileAsync(fileUrl.toString(), localFilePath, fileProp.lastModified)
-                            } else {
-                                println("skip download of file $filePath")
-                            }
+                        val fileUrl = remoteFile.file
+                        val filePath = File(remoteToLocalPath(remoteFile.file, localPath))
+                        if (!useLocal(remoteFile, filePath)) {
+                            downloadRemoteFileAsync(fileUrl.toString(), filePath.toString(), remoteFile.lastModified)
+                        } else {
+                            println("skip download of file $filePath")
                         }
                     }
                 }
-            jobs.forEach { it.join() }
+            jobs.joinAll()
         }
+
+    fun upload() =
+        runBlocking {
+            val remoteFileList = remoteFiles.map { File(remoteToLocalPath(it.file, localPath)) }.toSet()
+
+            // create a list of files which are not present at remote
+            val localFileList =
+                File(localPath)
+                    .walkTopDown()
+                    .filterNot { it in remoteFileList }
+                    .filter { it.isFile }
+                    .toMutableList()
+
+            // extend file list with files that are newer on local drive
+            remoteFiles.forEach {
+                val filePath = File(remoteToLocalPath(it.file, localPath))
+                if (it.lastModified.toInstant().toEpochMilli() < filePath.lastModified()) {
+                    localFileList.add(filePath)
+                }
+            }
+
+            val jobs =
+                localFileList.map<File, Job> { localFile ->
+                    launch {
+                        val remoteFileUrl =
+                            localPathToRemote(
+                                uri = remoteUrl,
+                                localRootPath = File(localPath),
+                                localFilePath = localFile,
+                            )
+                        uploadLocalFileAsync(remoteFileUrl, localFile)
+                    }
+                }
+            jobs.joinAll()
+        }
+
+    suspend fun uploadLocalFileAsync(
+        remoteFileUrl: String,
+        localFile: File,
+    ) {
+        semaphore.withPermit {
+            val request =
+                Request
+                    .Builder()
+                    .url(remoteFileUrl)
+                    .put(localFile.asRequestBody("application/octet-stream".toMediaType()))
+                    .header("Authorization", Credentials.basic(username, password))
+                    .header("X-OC-MTime", (localFile.lastModified() / 1000).toString())
+                    .build()
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        println("Failed to upload ${localFile.name}: ${response.code} ${response.message}")
+                    } else {
+                        println("Uploaded ${localFile.name} with mtime ${localFile.lastModified()}")
+                    }
+                }
+            } catch (e: Exception) {
+                println("Error uploading $remoteFileUrl: ${e.message}")
+            }
+        }
+    }
+
+    fun useLocal(
+        remote: RemoteFile,
+        local: File,
+    ): Boolean = remote.lastModified.toInstant().toEpochMilli() <= local.lastModified()
 
     suspend fun downloadRemoteFileAsync(
         fileUri: String,
         localFilePath: String,
-        lastModifiedTime: ZonedDateTime?,
+        lastModifiedTime: ZonedDateTime,
     ) {
         semaphore.withPermit {
             val request =
@@ -172,9 +208,7 @@ class NextcloudDAV(
                                 inputStream.copyTo(outputStream)
                             }
                         }
-                        if (lastModifiedTime != null) {
-                            localFile.setLastModified(lastModifiedTime.toInstant().toEpochMilli())
-                        }
+                        localFile.setLastModified(lastModifiedTime.toInstant().toEpochMilli())
                         println("Downloaded $fileUri to $localFilePath")
                     }
                 }

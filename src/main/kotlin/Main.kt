@@ -1,5 +1,6 @@
 package org.example
 
+import org.example.nextcloud.NextcloudDAV
 import java.io.FileInputStream
 import java.util.Properties
 

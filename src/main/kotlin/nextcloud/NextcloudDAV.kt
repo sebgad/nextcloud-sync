@@ -6,6 +6,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.serialization.decodeFromString
+import nl.adaptivity.xmlutil.XmlDeclMode
+import nl.adaptivity.xmlutil.core.XmlVersion
+import nl.adaptivity.xmlutil.serialization.XML
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Credentials
@@ -18,10 +22,16 @@ import okhttp3.Response
 import org.example.file.RemoteFile
 import org.example.file.localPathToRemote
 import org.example.file.remoteToLocalPath
+import org.example.xml.propfind.MultiStatus
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.net.URI
+import java.sql.Connection
+import java.sql.DriverManager
+import java.time.Instant
 import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import kotlin.collections.forEach
 
 class NextcloudDAV(
@@ -36,6 +46,11 @@ class NextcloudDAV(
     private val client = OkHttpClient()
     private val remoteFiles: MutableList<RemoteFile> = mutableListOf()
     private val semaphore = Semaphore(10)
+    private var captured: Long = 0
+
+    // Creates a database file
+    private val dbFile = File("$localPath/.nextcloud-dav-sync.db")
+    private val dbConnection: Connection = DriverManager.getConnection("jdbc:sqlite:$dbFile")
 
     fun getRemoteFileList() {
         requestOnGoing = true
@@ -78,9 +93,7 @@ class NextcloudDAV(
                     val responseBody = response.body?.string()
                     if (response.isSuccessful && responseBody != null) {
                         deserializePropFindReq(
-                            url = baseUrl,
                             xmlBody = responseBody,
-                            remoteFileList = remoteFiles,
                         )
                     } else {
                         println("Error: ${response.code}")
@@ -91,9 +104,89 @@ class NextcloudDAV(
         )
     }
 
-    fun sync() {
-        download()
-        upload()
+    fun deserializePropFindReq(xmlBody: String) {
+        val format =
+            XML {
+                xmlVersion = XmlVersion.XML10
+                xmlDeclMode = XmlDeclMode.Charset
+                indentString = "    "
+            }
+
+        captured = Instant.now().toEpochMilli()
+
+        val localFileList =
+            File(localPath)
+                .walkTopDown()
+                .filterNot { it == dbFile }
+                .filter { it.isFile }
+                .toMutableList()
+
+        val sqlInsert =
+            """
+            INSERT INTO syncTable (remoteUrl, remoteLastModified, localPath, localLastModified, captured)
+            VALUES (?, ?, ?, ?, ?)
+            """.trimIndent()
+
+        val multistatus = format.decodeFromString<MultiStatus>(xmlBody)
+
+        dbConnection.prepareStatement(sqlInsert).use { stmt ->
+            dbConnection.autoCommit = false
+
+            // Iterate over all Remote files
+            multistatus.response.forEach {
+                if (it.propstat.prop.getlastmodified != null) {
+                    val remoteLastModifiedTime =
+                        ZonedDateTime
+                            .parse(
+                                // text =
+                                it.propstat.prop.getlastmodified
+                                    .toString(),
+                                DateTimeFormatter.RFC_1123_DATE_TIME,
+                            )
+
+                    val localFilePath = File(remoteToLocalPath(URI(baseUrl + it.href.toString()), localPath))
+                    localFileList.remove(localFilePath)
+
+                    stmt.setString(1, baseUrl + it.href.toString())
+                    stmt.setLong(2, remoteLastModifiedTime.toInstant().toEpochMilli())
+                    stmt.setString(3, localFilePath.toString())
+                    stmt.setLong(4, localFilePath.lastModified())
+                    stmt.setLong(5, captured)
+                    stmt.addBatch()
+                }
+            }
+
+            // iterate over every leftover local file
+            localFileList.forEach {
+                stmt.setString(1, localPathToRemote(baseUrl, File(localPath), it))
+                stmt.setLong(2, 0)
+                stmt.setString(3, it.toString())
+                stmt.setLong(4, it.lastModified())
+                stmt.setLong(5, captured)
+                stmt.addBatch()
+            }
+
+            stmt.executeBatch()
+            dbConnection.commit()
+            dbConnection.autoCommit = true
+        }
+    }
+
+    fun initialize() {
+        dbConnection.createStatement().use { stmt ->
+            stmt.executeUpdate(
+                """
+                CREATE TABLE IF NOT EXISTS syncTable (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                remoteUrl TEXT,
+                                remoteLastModified INTEGER,
+                                localPath TEXT,
+                                localLastModified INTEGER,
+                                captured INTEGER
+                )
+                """.trimIndent(),
+            )
+        }
     }
 
     fun download() =
@@ -122,6 +215,7 @@ class NextcloudDAV(
                 File(localPath)
                     .walkTopDown()
                     .filterNot { it in remoteFileList }
+                    .filterNot { it == dbFile }
                     .filter { it.isFile }
                     .toMutableList()
 

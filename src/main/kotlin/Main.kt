@@ -1,11 +1,8 @@
 package org.example
 
 import org.example.nextcloud.NextcloudDAV
-import org.slf4j.LoggerFactory
 import java.io.FileInputStream
 import java.util.Properties
-
-val logger = LoggerFactory.getLogger("MyLogger")
 
 data class Credentials(
     val baseUrl: String,
@@ -39,9 +36,14 @@ fun main() {
             localPath = cred.localPath,
         )
     nextCloudClient.initialize()
+    println("initialized")
     nextCloudClient.getRemoteFileList()
+    println("remote file list fetched")
     while (nextCloudClient.requestOnGoing) {
         Thread.sleep(500)
     }
-    // nextCloudClient.sync()
+    println("uploading file list")
+    nextCloudClient.upload()
+    println("downloading file list")
+    nextCloudClient.download()
 }

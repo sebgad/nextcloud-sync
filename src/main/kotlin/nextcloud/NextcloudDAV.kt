@@ -19,7 +19,8 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import org.example.file.RemoteFile
+import org.example.file.NextcloudFile
+import org.example.file.executeSqlQuery
 import org.example.file.localPathToRemote
 import org.example.file.remoteToLocalPath
 import org.example.xml.propfind.MultiStatus
@@ -32,6 +33,8 @@ import java.sql.DriverManager
 import java.time.Instant
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import kotlin.Long
+import kotlin.String
 import kotlin.collections.forEach
 
 class NextcloudDAV(
@@ -44,7 +47,6 @@ class NextcloudDAV(
     private val remoteUrl = "$baseUrl/remote.php/dav/files/$username"
 
     private val client = OkHttpClient()
-    private val remoteFiles: MutableList<RemoteFile> = mutableListOf()
     private val semaphore = Semaphore(10)
     private var captured: Long = 0
 
@@ -150,7 +152,7 @@ class NextcloudDAV(
                     stmt.setString(1, baseUrl + it.href.toString())
                     stmt.setLong(2, remoteLastModifiedTime.toInstant().toEpochMilli())
                     stmt.setString(3, localFilePath.toString())
-                    stmt.setLong(4, localFilePath.lastModified())
+                    stmt.setLong(4, (localFilePath.lastModified() / 1000) * 1000)
                     stmt.setLong(5, captured)
                     stmt.addBatch()
                 }
@@ -158,7 +160,7 @@ class NextcloudDAV(
 
             // iterate over every leftover local file
             localFileList.forEach {
-                stmt.setString(1, localPathToRemote(baseUrl, File(localPath), it))
+                stmt.setString(1, localPathToRemote(remoteUrl, File(localPath), it))
                 stmt.setLong(2, 0)
                 stmt.setString(3, it.toString())
                 stmt.setLong(4, it.lastModified())
@@ -191,16 +193,73 @@ class NextcloudDAV(
 
     fun download() =
         runBlocking {
+            var downloadList: MutableList<NextcloudFile> = mutableListOf()
+            /* systematic:
+                - Take the most recent two captures of the local and remote file system
+                - Filter entries
+                    - where the number of unique remoteLastModified is two AND
+                    - where the number of unique localLastModified is one -> remote file changed
+             */
+            var sqlString =
+                """
+                SELECT *, COUNT(DISTINCT remoteLastModified), COUNT(DISTINCT localLastModified)
+                FROM syncTable
+                WHERE captured IN (
+                    SELECT DISTINCT captured
+                    FROM syncTable
+                    ORDER BY captured DESC
+                    LIMIT 2
+                    )
+                GROUP BY localPath
+                HAVING
+                COUNT(DISTINCT remoteLastModified) = 2
+                AND
+                COUNT(DISTINCT localLastModified) = 1
+                """.trimIndent()
+
+            executeSqlQuery(
+                dbConnection = dbConnection,
+                sqlString = sqlString,
+                nextCloudFiles = downloadList,
+            )
+
+            /*
+            systematic:
+            - Take the most recent two captures of the local and remote file system
+            - Filter entries
+                - where the number of captured entries for this file is only 1 AND
+                - where the localLastModified equals to 0 (No timestamp is set, because remote file n.a.)
+             */
+            sqlString =
+                """
+                SELECT *, COUNT(captured)
+                FROM syncTable
+                WHERE captured IN (
+                    SELECT DISTINCT captured
+                    FROM syncTable
+                    ORDER BY captured DESC
+                    LIMIT 2
+                )
+                GROUP by localPath
+                HAVING COUNT(captured) = 1
+                AND
+                localLastModified = 0;
+                """.trimIndent()
+
+            executeSqlQuery(
+                dbConnection = dbConnection,
+                sqlString = sqlString,
+                nextCloudFiles = downloadList,
+            )
+
             val jobs =
-                remoteFiles.map<RemoteFile, Job> { remoteFile ->
+                downloadList.map<NextcloudFile, Job> { nextcloudFile ->
                     launch {
-                        val fileUrl = remoteFile.file
-                        val filePath = File(remoteToLocalPath(remoteFile.file, localPath))
-                        if (!useLocal(remoteFile, filePath)) {
-                            downloadRemoteFileAsync(fileUrl.toString(), filePath.toString(), remoteFile.lastModified)
-                        } else {
-                            println("skip download of file $filePath")
-                        }
+                        downloadRemoteFileAsync(
+                            nextcloudFile.remoteUrl,
+                            nextcloudFile.localPath,
+                            nextcloudFile.localLastModified,
+                        )
                     }
                 }
             jobs.joinAll()
@@ -208,35 +267,71 @@ class NextcloudDAV(
 
     fun upload() =
         runBlocking {
-            val remoteFileList = remoteFiles.map { File(remoteToLocalPath(it.file, localPath)) }.toSet()
+            var uploadList: MutableList<NextcloudFile> = mutableListOf()
+/*            systematic:
+            - Take the most recent two captures of the local and remote file system
+            - Filter entries
+                    - where the number of unique remoteLastModified is only 1 AND
+                    - where the number of unique localLastModified is two -> local file changed */
+            var sqlString =
+                """
+                SELECT *, COUNT(DISTINCT remoteLastModified), COUNT(DISTINCT localLastModified)
+                FROM syncTable
+                WHERE captured IN (
+                    SELECT DISTINCT captured
+                    FROM syncTable
+                    ORDER BY captured DESC
+                    LIMIT 2
+                    )
+                GROUP BY localPath
+                HAVING
+                COUNT(DISTINCT remoteLastModified) = 1
+                AND
+                COUNT(DISTINCT localLastModified) = 2
+                """.trimIndent()
 
-            // create a list of files which are not present at remote
-            val localFileList =
-                File(localPath)
-                    .walkTopDown()
-                    .filterNot { it in remoteFileList }
-                    .filterNot { it == dbFile }
-                    .filter { it.isFile }
-                    .toMutableList()
+            executeSqlQuery(
+                dbConnection = dbConnection,
+                sqlString = sqlString,
+                nextCloudFiles = uploadList,
+            )
 
-            // extend file list with files that are newer on local drive
-            remoteFiles.forEach {
-                val filePath = File(remoteToLocalPath(it.file, localPath))
-                if (it.lastModified.toInstant().toEpochMilli() < filePath.lastModified()) {
-                    localFileList.add(filePath)
-                }
-            }
+/*            systematic:
+            - Take the most recent two captures of the local and remote file system
+            - Filter entries
+                    - where the number of captured entries for this file is only 1 AND
+                    - where the remoteLastModified equals to 0 (No timestamp is set, because remote file n.a.) */
+
+            sqlString =
+                """
+                SELECT *, COUNT(captured)
+                FROM syncTable
+                WHERE captured IN (
+                    SELECT DISTINCT captured
+                    FROM syncTable
+                    ORDER BY captured DESC
+                    LIMIT 2
+                )
+                GROUP by localPath
+                HAVING COUNT(captured) = 1
+                AND
+                remoteLastModified = 0;
+                """.trimIndent()
+
+            executeSqlQuery(
+                dbConnection = dbConnection,
+                sqlString = sqlString,
+                nextCloudFiles = uploadList,
+            )
 
             val jobs =
-                localFileList.map<File, Job> { localFile ->
+                uploadList.map<NextcloudFile, Job> { nextcloudFile ->
                     launch {
-                        val remoteFileUrl =
-                            localPathToRemote(
-                                uri = remoteUrl,
-                                localRootPath = File(localPath),
-                                localFilePath = localFile,
-                            )
-                        uploadLocalFileAsync(remoteFileUrl, localFile)
+                        println("uploading file: ${nextcloudFile.localPath}")
+                        uploadLocalFileAsync(
+                            nextcloudFile.remoteUrl,
+                            File(nextcloudFile.localPath),
+                        )
                     }
                 }
             jobs.joinAll()
@@ -256,6 +351,7 @@ class NextcloudDAV(
                     .header("X-OC-MTime", (localFile.lastModified() / 1000).toString())
                     .build()
             try {
+                println("try uploading $remoteFileUrl")
                 client.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) {
                         println("Failed to upload ${localFile.name}: ${response.code} ${response.message}")
@@ -269,15 +365,10 @@ class NextcloudDAV(
         }
     }
 
-    fun useLocal(
-        remote: RemoteFile,
-        local: File,
-    ): Boolean = remote.lastModified.toInstant().toEpochMilli() <= local.lastModified()
-
     suspend fun downloadRemoteFileAsync(
         fileUri: String,
         localFilePath: String,
-        lastModifiedTime: ZonedDateTime,
+        lastModifiedTime: Long,
     ) {
         semaphore.withPermit {
             val request =
@@ -302,21 +393,13 @@ class NextcloudDAV(
                                 inputStream.copyTo(outputStream)
                             }
                         }
-                        localFile.setLastModified(lastModifiedTime.toInstant().toEpochMilli())
+                        localFile.setLastModified(lastModifiedTime)
                         println("Downloaded $fileUri to $localFilePath")
                     }
                 }
             } catch (e: Exception) {
                 println("Error downloading $fileUri: ${e.message}")
             }
-        }
-    }
-
-    fun printRemoteFileList() {
-        remoteFiles.forEach {
-            println("DisplayName: ${it.displayName}")
-            println("File: ${it.file}")
-            println("Modified: ${it.lastModified}")
         }
     }
 }

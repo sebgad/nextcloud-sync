@@ -147,6 +147,7 @@ class NextcloudDAV(
                             )
 
                     val localFilePath = File(remoteToLocalPath(URI(baseUrl + it.href.toString()), localPath))
+                    println("fetch file information $localFilePath")
                     localFileList.remove(localFilePath)
 
                     stmt.setString(1, baseUrl + it.href.toString())
@@ -258,7 +259,7 @@ class NextcloudDAV(
                         downloadRemoteFileAsync(
                             nextcloudFile.remoteUrl,
                             nextcloudFile.localPath,
-                            nextcloudFile.localLastModified,
+                            nextcloudFile.remoteLastModified,
                         )
                     }
                 }
@@ -272,7 +273,10 @@ class NextcloudDAV(
             - Take the most recent two captures of the local and remote file system
             - Filter entries
                     - where the number of unique remoteLastModified is only 1 AND
-                    - where the number of unique localLastModified is two -> local file changed */
+                    - where the number of unique localLastModified is two -> local file changed AND
+                    - where localLastModified has no entries with 0
+
+*/
             var sqlString =
                 """
                 SELECT *, COUNT(DISTINCT remoteLastModified), COUNT(DISTINCT localLastModified)
@@ -288,6 +292,8 @@ class NextcloudDAV(
                 COUNT(DISTINCT remoteLastModified) = 1
                 AND
                 COUNT(DISTINCT localLastModified) = 2
+                AND
+                localLastModified != 0
                 """.trimIndent()
 
             executeSqlQuery(
@@ -336,6 +342,97 @@ class NextcloudDAV(
                 }
             jobs.joinAll()
         }
+
+    fun deleteOnRemote() =
+        runBlocking {
+            var deleteList: MutableList<NextcloudFile> = mutableListOf()
+
+            /*
+            systematic:
+            - Take the most recent two captures of the local and remote file system
+            - Filter entries
+              - where the number of unique remoteLastModified is only 1 AND
+              - where the number of unique localLastModified is two -> local file changed AND
+              - where an entry of localLastModified equals zero
+*/
+            var sqlString =
+                """
+                SELECT *, COUNT(DISTINCT remoteLastModified), COUNT(DISTINCT localLastModified)
+                FROM syncTable
+                WHERE captured IN (
+                    SELECT DISTINCT captured
+                    FROM syncTable
+                    ORDER BY captured DESC
+                    LIMIT 2
+                    )
+                GROUP BY localPath
+                HAVING
+                COUNT(DISTINCT remoteLastModified) = 1
+                AND
+                COUNT(DISTINCT localLastModified) = 2
+                AND
+                localLastModified == 0
+                """.trimIndent()
+
+            executeSqlQuery(
+                dbConnection = dbConnection,
+                sqlString = sqlString,
+                nextCloudFiles = deleteList,
+            )
+
+            val jobs =
+                deleteList.map<NextcloudFile, Job> { nextcloudFile ->
+                    launch {
+                        println("deleting file: ${nextcloudFile.remoteUrl}")
+                        deleteOnRemoteAsync(
+                            nextcloudFile.remoteUrl,
+                        )
+                    }
+                }
+            jobs.joinAll()
+        }
+
+    fun deleteOnLocal() {
+        var deleteList: MutableList<NextcloudFile> = mutableListOf()
+            /*
+            systematic:
+                - Take the most recent two captures of the local and remote file system
+                - Filter entries
+                  - where the number of unique remoteLastModified is only 1 AND
+                  - where the number of unique localLastModified is two -> local file changed AND
+                  - where an entry of localLastModified equals zero
+             */
+
+        val sqlString =
+            """
+            SELECT *, COUNT(DISTINCT remoteLastModified), COUNT(DISTINCT localLastModified)
+            FROM syncTable
+            WHERE captured IN (
+                SELECT DISTINCT captured
+                FROM syncTable
+                ORDER BY captured DESC
+                LIMIT 2
+                )
+            GROUP BY localPath
+            HAVING
+            COUNT(DISTINCT remoteLastModified) = 2
+            AND
+            COUNT(DISTINCT localLastModified) = 1
+            AND
+            remoteLastModified == 0
+            """.trimIndent()
+
+        executeSqlQuery(
+            dbConnection = dbConnection,
+            sqlString = sqlString,
+            nextCloudFiles = deleteList,
+        )
+
+        deleteList.forEach {
+            println("delete file ${it.localPath}")
+            File(it.localPath).delete()
+        }
+    }
 
     suspend fun uploadLocalFileAsync(
         remoteFileUrl: String,
@@ -399,6 +496,29 @@ class NextcloudDAV(
                 }
             } catch (e: Exception) {
                 println("Error downloading $fileUri: ${e.message}")
+            }
+        }
+    }
+
+    suspend fun deleteOnRemoteAsync(fileUri: String) {
+        semaphore.withPermit {
+            val request =
+                Request
+                    .Builder()
+                    .url(fileUri)
+                    .header("Authorization", Credentials.basic(username, password))
+                    .delete()
+                    .build()
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        println("Failed to delete $fileUri: ${response.code}")
+                    } else {
+                        println("Deleted file $fileUri")
+                    }
+                }
+            } catch (e: Exception) {
+                println("Error delete $fileUri: ${e.message}")
             }
         }
     }

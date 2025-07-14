@@ -2,6 +2,7 @@ package org.example.file
 
 import java.io.File
 import java.net.URI
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.sql.Connection
@@ -13,6 +14,20 @@ fun remoteToLocalPath(
 ): String {
     val uriList = uri.path.split("/").filter { it.isNotEmpty() }
     return localPath + "/" + uriList.subList(4, uriList.size).joinToString("/")
+}
+
+fun remoteToBasePath(uri: String): String {
+    val uriList = uri.split("/").filter { it.isNotEmpty() }
+    val uriBase = uriList.subList(4, uriList.size).joinToString("/")
+    return URLDecoder.decode(uriBase, StandardCharsets.UTF_8.toString())
+}
+
+fun baseToRemotePath(
+    uriPath: String,
+    basePath: String,
+): String {
+    val encodedUrl = URLEncoder.encode(uriPath, StandardCharsets.UTF_8.toString()).toString().replace("+", "%20")
+    return "$basePath/$encodedUrl"
 }
 
 fun localPathToRemote(
@@ -29,6 +44,8 @@ fun executeSqlQuery(
     dbConnection: Connection,
     sqlString: String,
     nextCloudFiles: MutableList<NextcloudFile>,
+    remoteBase: String,
+    localBase: String,
 ) {
     dbConnection.createStatement().use { statement ->
         val resultSet = statement.executeQuery(sqlString)
@@ -36,9 +53,9 @@ fun executeSqlQuery(
         while (resultSet.next()) {
             nextCloudFiles.add(
                 NextcloudFile(
-                    remoteUrl = resultSet.getString("remoteUrl"),
+                    remoteUrl = baseToRemotePath(resultSet.getString("path"), remoteBase),
                     remoteLastModified = resultSet.getLong("remoteLastModified"),
-                    localPath = resultSet.getString("localPath"),
+                    localPath = "$localBase/${resultSet.getString("path")}",
                     localLastModified = resultSet.getLong("localLastModified"),
                     captured = resultSet.getLong("captured"),
                 ),

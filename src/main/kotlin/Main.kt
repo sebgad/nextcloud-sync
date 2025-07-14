@@ -36,14 +36,16 @@ fun main() {
             localPath = cred.localPath,
         )
     nextCloudClient.initialize()
-    nextCloudClient.getRemoteFileList()
+    nextCloudClient.updateRemoteFileList()
     while (nextCloudClient.requestOnGoing) {
         Thread.sleep(500)
     }
-    nextCloudClient.upload()
+    nextCloudClient.updateLocalFileList()
+    // nextCloudClient.upload()
     nextCloudClient.download()
-    nextCloudClient.deleteOnLocal()
-    nextCloudClient.deleteOnRemote()
-    nextCloudClient.getRemoteFileList()
+    // nextCloudClient.deleteOnLocal()
+    // nextCloudClient.deleteOnRemote()
+    // nextCloudClient.getRemoteFileList()
     println("finished sync")
+    nextCloudClient.close()
 }

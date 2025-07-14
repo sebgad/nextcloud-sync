@@ -2,9 +2,10 @@
 
 ## Synchronization cases
 
-A: File in filesystem
-abcdef...z: LastModified timestamp
-x: File is not available
+- A: File in filesystem
+- abcdef...z: LastModified timestamp
+- x: File is not available
+
 
 | client   | remote   | result                                                                    | SQL statement |
 |----------|----------|---------------------------------------------------------------------------|---------------|

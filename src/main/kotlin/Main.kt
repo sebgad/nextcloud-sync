@@ -14,7 +14,6 @@ data class Credentials(
 object CredentialProvider {
     fun getCredentials(): Credentials {
         val props = Properties()
-        println("Working dir: " + System.getProperty("user.dir"))
         FileInputStream("src/main/resources/credentials.properties").use { props.load(it) }
 
         return Credentials(
@@ -41,11 +40,10 @@ fun main() {
         Thread.sleep(500)
     }
     nextCloudClient.updateLocalFileList()
-    // nextCloudClient.upload()
+    nextCloudClient.resolveConflicts()
     nextCloudClient.download()
-    // nextCloudClient.deleteOnLocal()
-    // nextCloudClient.deleteOnRemote()
-    // nextCloudClient.getRemoteFileList()
-    println("finished sync")
+    nextCloudClient.upload()
+    nextCloudClient.deleteOnLocal()
+    nextCloudClient.deleteOnRemote()
     nextCloudClient.close()
 }

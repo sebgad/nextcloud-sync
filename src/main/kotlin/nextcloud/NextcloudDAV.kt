@@ -28,8 +28,8 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.sql.Connection
 import java.sql.DriverManager
-import java.sql.PreparedStatement
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import kotlin.Long
@@ -37,7 +37,7 @@ import kotlin.String
 import kotlin.collections.forEach
 
 class NextcloudDAV(
-    private val baseUrl: String,
+    baseUrl: String,
     private val username: String,
     private val password: String,
     private val localPath: String,
@@ -52,15 +52,6 @@ class NextcloudDAV(
     // Creates a database file
     private val dbFile = File("$localPath/.nextcloud-dav-sync.db")
     private val dbConnection: Connection = DriverManager.getConnection("jdbc:sqlite:$dbFile")
-
-    fun updateExists() {
-        val stmt: PreparedStatement =
-            dbConnection.prepareStatement(
-                "UPDATE syncTable SET existsRemote = 0, existsLocal = 0",
-            )
-        stmt.executeUpdate()
-        stmt.close()
-    }
 
     fun updateRemoteFileList() {
         requestOnGoing = true
@@ -121,8 +112,6 @@ class NextcloudDAV(
                 xmlDeclMode = XmlDeclMode.Charset
                 indentString = "    "
             }
-
-        captured = Instant.now().toEpochMilli()
 
         val sqlInsert =
             """
@@ -188,7 +177,7 @@ class NextcloudDAV(
 
             localFileList.forEach {
                 stmt.setString(1, it.relativeTo(File(localPath)).toString())
-                stmt.setLong(2, it.lastModified())
+                stmt.setLong(2, (it.lastModified() / 1000L) * 1000L)
                 stmt.setBoolean(3, true)
                 stmt.setLong(4, captured)
                 stmt.addBatch()
@@ -206,14 +195,110 @@ class NextcloudDAV(
                 CREATE TABLE IF NOT EXISTS syncTable (
                                 path TEXT PRIMARY KEY,
                                 remoteLastModified INTEGER,
+                                remoteLastModifiedPrev INTEGER,
                                 existsRemote BOOLEAN DEFAULT FALSE,
                                 localLastModified INTEGER,
+                                localLastModifiedPrev INTEGER,
                                 existsLocal BOOLEAN DEFAULT FALSE,
                                 synced BOOLEAN DEFAULT FALSE,
                                 captured INTEGER
                 )
                 """.trimIndent(),
             )
+
+            stmt.executeUpdate(
+                """
+                UPDATE syncTable
+                SET existsRemote = FALSE,
+                    existsLocal = FALSE
+                """.trimIndent(),
+            )
+
+            captured = Instant.now().toEpochMilli()
+        }
+    }
+
+    fun resolveConflicts() {
+        var fileList: MutableList<NextcloudFile> = mutableListOf()
+
+        var sqlString =
+            """
+            SELECT *
+            FROM syncTable
+            WHERE
+                (localLastModifiedPrev != localLastModified) AND
+                (remoteLastModifiedPrev != remoteLastModified) AND
+                (remoteLastModifiedPrev != 0) AND
+                (localLastModifiedPrev != 0) AND
+                (existsRemote = TRUE) AND
+                (existsLocal = TRUE)
+            """.trimIndent()
+
+        executeSqlQuery(
+            dbConnection = dbConnection,
+            sqlString = sqlString,
+            nextCloudFiles = fileList,
+            remoteBase = remoteUrl,
+            localBase = localPath,
+        )
+
+        sqlString =
+            """
+            INSERT INTO syncTable (path, localLastModified, existsLocal, captured)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                localLastModified = excluded.localLastModified,
+                existsLocal = TRUE,
+                captured = excluded.captured;
+            """.trimIndent()
+
+        dbConnection.prepareStatement(sqlString).use { stmt ->
+            dbConnection.autoCommit = false
+            // Copy local file with conflict in its name
+            fileList.forEach {
+                val localFile = File(it.localPath)
+                val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd-HH-mm-ss")
+                val newFile =
+                    localFile.copyTo(
+                        File(
+                            "${localFile.parent}/${localFile.nameWithoutExtension}_conflict_${
+                                Instant.now()
+                                    .atZone(ZoneId.systemDefault())
+                                    .format(formatter)
+                            }.${localFile.extension}",
+                        ),
+                    )
+                if (newFile.exists()) {
+                    stmt.setString(1, newFile.relativeTo(File(localPath)).toString())
+                    stmt.setLong(2, newFile.lastModified() / 1000L * 1000L)
+                    stmt.setBoolean(3, true)
+                    stmt.setLong(4, captured)
+                    stmt.addBatch()
+                }
+            }
+            stmt.executeBatch()
+            dbConnection.commit()
+            dbConnection.autoCommit = true
+        }
+
+        sqlString =
+            """
+            UPDATE syncTable
+            SET localLastModified = 0
+            WHERE path = ?
+            """.trimIndent()
+
+        dbConnection.prepareStatement(sqlString).use { stmt ->
+            dbConnection.autoCommit = false
+            // Copy local file with conflict in its name
+            fileList.forEach {
+                val localFile = File(it.localPath)
+                stmt.setString(1, localFile.relativeTo(File(localPath)).toString())
+                stmt.addBatch()
+            }
+            stmt.executeBatch()
+            dbConnection.commit()
+            dbConnection.autoCommit = true
         }
     }
 
@@ -269,31 +354,11 @@ class NextcloudDAV(
     fun upload() =
         runBlocking {
             var uploadList: MutableList<NextcloudFile> = mutableListOf()
-/*            systematic:
-            - Take the most recent two captures of the local and remote file system
-            - Filter entries
-                    - where the number of unique remoteLastModified is only 1 AND
-                    - where the number of unique localLastModified is two -> local file changed AND
-                    - where localLastModified has no entries with 0
-
-*/
             var sqlString =
                 """
-                SELECT *, COUNT(DISTINCT remoteLastModified), COUNT(DISTINCT localLastModified)
+                SELECT *
                 FROM syncTable
-                WHERE captured IN (
-                    SELECT DISTINCT captured
-                    FROM syncTable
-                    ORDER BY captured DESC
-                    LIMIT 2
-                    )
-                GROUP BY localPath
-                HAVING
-                COUNT(DISTINCT remoteLastModified) = 1
-                AND
-                COUNT(DISTINCT localLastModified) = 2
-                AND
-                localLastModified != 0
+                WHERE (existsRemote = FALSE) AND (synced = FALSE);
                 """.trimIndent()
 
             executeSqlQuery(
@@ -304,26 +369,12 @@ class NextcloudDAV(
                 localBase = localPath,
             )
 
-/*            systematic:
-            - Take the most recent two captures of the local and remote file system
-            - Filter entries
-                    - where the number of captured entries for this file is only 1 AND
-                    - where the remoteLastModified equals to 0 (No timestamp is set, because remote file n.a.) */
-
+            // Load files from server which are newer and have already been synced
             sqlString =
                 """
-                SELECT *, COUNT(captured)
+                SELECT *
                 FROM syncTable
-                WHERE captured IN (
-                    SELECT DISTINCT captured
-                    FROM syncTable
-                    ORDER BY captured DESC
-                    LIMIT 2
-                )
-                GROUP by localPath
-                HAVING COUNT(captured) = 1
-                AND
-                remoteLastModified = 0;
+                WHERE (remoteLastModified < localLastModified) AND (synced = TRUE);
                 """.trimIndent()
 
             executeSqlQuery(
@@ -351,31 +402,13 @@ class NextcloudDAV(
         runBlocking {
             var deleteList: MutableList<NextcloudFile> = mutableListOf()
 
-            /*
-            systematic:
-            - Take the most recent two captures of the local and remote file system
-            - Filter entries
-              - where the number of unique remoteLastModified is only 1 AND
-              - where the number of unique localLastModified is two -> local file changed AND
-              - where an entry of localLastModified equals zero
-*/
-            var sqlString =
+            val sqlString =
                 """
-                SELECT *, COUNT(DISTINCT remoteLastModified), COUNT(DISTINCT localLastModified)
-                FROM syncTable
-                WHERE captured IN (
-                    SELECT DISTINCT captured
-                    FROM syncTable
-                    ORDER BY captured DESC
-                    LIMIT 2
-                    )
-                GROUP BY localPath
-                HAVING
-                COUNT(DISTINCT remoteLastModified) = 1
-                AND
-                COUNT(DISTINCT localLastModified) = 2
-                AND
-                localLastModified == 0
+                SELECT * FROM syncTable
+                WHERE 
+                    (existsRemote = TRUE) AND
+                    (existsLocal = FALSE) AND
+                    (synced = TRUE)
                 """.trimIndent()
 
             executeSqlQuery(
@@ -389,7 +422,6 @@ class NextcloudDAV(
             val jobs =
                 deleteList.map<NextcloudFile, Job> { nextcloudFile ->
                     launch {
-                        println("deleting file: ${nextcloudFile.remoteUrl}")
                         deleteOnRemoteAsync(
                             nextcloudFile.remoteUrl,
                         )
@@ -400,32 +432,13 @@ class NextcloudDAV(
 
     fun deleteOnLocal() {
         var deleteList: MutableList<NextcloudFile> = mutableListOf()
-            /*
-            systematic:
-                - Take the most recent two captures of the local and remote file system
-                - Filter entries
-                  - where the number of unique remoteLastModified is only 1 AND
-                  - where the number of unique localLastModified is two -> local file changed AND
-                  - where an entry of localLastModified equals zero
-             */
 
-        val sqlString =
+        var sqlString =
             """
-            SELECT *, COUNT(DISTINCT remoteLastModified), COUNT(DISTINCT localLastModified)
+            SELECT *
             FROM syncTable
-            WHERE captured IN (
-                SELECT DISTINCT captured
-                FROM syncTable
-                ORDER BY captured DESC
-                LIMIT 2
-                )
-            GROUP BY localPath
-            HAVING
-            COUNT(DISTINCT remoteLastModified) = 2
-            AND
-            COUNT(DISTINCT localLastModified) = 1
-            AND
-            remoteLastModified == 0
+            WHERE (existsRemote = FALSE) AND 
+                  (synced = TRUE);
             """.trimIndent()
 
         executeSqlQuery(
@@ -436,9 +449,26 @@ class NextcloudDAV(
             localBase = localPath,
         )
 
-        deleteList.forEach {
-            println("delete file ${it.localPath}")
-            File(it.localPath).delete()
+        sqlString =
+            """
+            DELETE FROM syncTable
+            WHERE path = ?
+            """.trimIndent()
+
+        dbConnection.prepareStatement(sqlString).use { stmt ->
+            dbConnection.autoCommit = false
+            deleteList.forEach {
+                val deletedFile = File(it.localPath)
+
+                if (deletedFile.delete() or !(deletedFile.exists())) {
+                    println("local file ${it.localPath} deleted")
+                    stmt.setString(1, deletedFile.relativeTo(File(localPath)).toString())
+                    stmt.addBatch()
+                }
+            }
+            stmt.executeBatch()
+            dbConnection.commit()
+            dbConnection.autoCommit = true
         }
     }
 
@@ -447,6 +477,15 @@ class NextcloudDAV(
         localFile: File,
     ) {
         semaphore.withPermit {
+            val sqlString =
+                """
+                UPDATE syncTable
+                SET existsRemote = TRUE, 
+                    remoteLastModified = ?,
+                    synced = TRUE
+                WHERE path = ?
+                """.trimIndent()
+
             val request =
                 Request
                     .Builder()
@@ -455,17 +494,27 @@ class NextcloudDAV(
                     .header("Authorization", Credentials.basic(username, password))
                     .header("X-OC-MTime", (localFile.lastModified() / 1000).toString())
                     .build()
-            try {
-                println("try uploading $remoteFileUrl")
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        println("Failed to upload ${localFile.name}: ${response.code} ${response.message}")
-                    } else {
-                        println("Uploaded ${localFile.name} with mtime ${localFile.lastModified()}")
+
+            dbConnection.prepareStatement(sqlString).use { stmt ->
+                dbConnection.autoCommit = false
+                try {
+                    println("try uploading $remoteFileUrl")
+                    client.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful) {
+                            println("Failed to upload ${localFile.name}: ${response.code} ${response.message}")
+                        } else {
+                            println("Uploaded ${localFile.name} with mtime ${(localFile.lastModified() / 1000L) * 1000L}")
+                            stmt.setLong(1, (localFile.lastModified() / 1000L) * 1000L)
+                            stmt.setString(2, localFile.relativeTo(File(localPath)).toString())
+                            stmt.addBatch()
+                        }
                     }
+                } catch (e: Exception) {
+                    println("Error uploading $remoteFileUrl: ${e.message}")
                 }
-            } catch (e: Exception) {
-                println("Error uploading $remoteFileUrl: ${e.message}")
+                stmt.executeBatch()
+                dbConnection.commit()
+                dbConnection.autoCommit = true
             }
         }
     }
@@ -531,6 +580,12 @@ class NextcloudDAV(
     }
 
     suspend fun deleteOnRemoteAsync(fileUri: String) {
+        val sqlString =
+            """
+            DELETE FROM syncTable
+            WHERE path = ?
+            """.trimIndent()
+
         semaphore.withPermit {
             val request =
                 Request
@@ -539,21 +594,51 @@ class NextcloudDAV(
                     .header("Authorization", Credentials.basic(username, password))
                     .delete()
                     .build()
-            try {
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        println("Failed to delete $fileUri: ${response.code}")
-                    } else {
-                        println("Deleted file $fileUri")
+            dbConnection.prepareStatement(sqlString).use { stmt ->
+                dbConnection.autoCommit = false
+                try {
+                    client.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful) {
+                            println("Failed to delete $fileUri: ${response.code}")
+                        } else {
+                            println("File $fileUri deleted on Remote.")
+                            stmt.setString(1, remoteToBasePath(fileUri))
+                            stmt.addBatch()
+                        }
                     }
+                } catch (e: Exception) {
+                    println("Error delete $fileUri: ${e.message}")
                 }
-            } catch (e: Exception) {
-                println("Error delete $fileUri: ${e.message}")
+                stmt.executeBatch()
+                dbConnection.commit()
+                dbConnection.autoCommit = true
             }
         }
     }
 
     fun close() {
+        dbConnection.createStatement().use { stmt ->
+            stmt.executeUpdate(
+                """
+                UPDATE syncTable
+                SET synced = TRUE
+                WHERE
+                    (existsRemote = TRUE) AND
+                    (existsLocal = TRUE) AND
+                    (localLastModified = remoteLastModified) AND
+                    (synced = FALSE)
+                """.trimIndent(),
+            )
+
+            stmt.executeUpdate(
+                """
+                UPDATE syncTable
+                SET localLastModifiedPrev = localLastModified,
+                    remoteLastModifiedPrev = remoteLastModified
+                """.trimIndent(),
+            )
+        }
+
         dbConnection.close()
     }
 }

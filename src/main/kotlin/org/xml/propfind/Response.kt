@@ -1,12 +1,14 @@
-package org.example.xml.propfind
+package org.xml.propfind
 
 import kotlinx.serialization.Serializable
 import nl.adaptivity.xmlutil.serialization.XmlElement
 import nl.adaptivity.xmlutil.serialization.XmlSerialName
 
 @Serializable
-@XmlSerialName("resourcetype", namespace = "DAV:", prefix = "d")
-data class ResourceType(
+@XmlSerialName("response", namespace = "DAV:", prefix = "d")
+data class Response(
     @XmlElement(true)
-    val collection: String? = null,
+    val href: String,
+    @XmlElement(true)
+    val propstat: PropStat,
 )

@@ -1,1 +1,1 @@
-rootProject.name = "nextcloud"
+"nextcloud".also { rootProject.name = it }

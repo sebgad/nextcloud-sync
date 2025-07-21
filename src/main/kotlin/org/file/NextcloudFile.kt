@@ -1,4 +1,4 @@
-package org.example.file
+package org.file
 
 data class NextcloudFile(
     val remoteUrl: String,

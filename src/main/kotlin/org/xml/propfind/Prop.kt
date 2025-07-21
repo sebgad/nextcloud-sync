@@ -1,4 +1,4 @@
-package org.example.xml.propfind
+package org.xml.propfind
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable

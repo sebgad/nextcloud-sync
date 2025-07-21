@@ -1,6 +1,4 @@
-package org.example
-
-import org.example.nextcloud.NextcloudDAV
+import org.nextcloud.NextcloudDAV
 import java.io.FileInputStream
 import java.util.Properties
 
@@ -14,7 +12,7 @@ data class Credentials(
 object CredentialProvider {
     fun getCredentials(): Credentials {
         val props = Properties()
-        FileInputStream("src/main/resources/credentials.properties").use { props.load(it) }
+        FileInputStream("src/test/resources/credentials.properties").use { props.load(it) }
 
         return Credentials(
             baseUrl = props.getProperty("baseUrl") ?: error("Missing baseUrl"),

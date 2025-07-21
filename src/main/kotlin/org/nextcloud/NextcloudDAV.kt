@@ -1,4 +1,4 @@
-package org.example.nextcloud
+package org.nextcloud
 
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.joinAll
@@ -10,28 +10,23 @@ import kotlinx.serialization.decodeFromString
 import nl.adaptivity.xmlutil.XmlDeclMode
 import nl.adaptivity.xmlutil.core.XmlVersion
 import nl.adaptivity.xmlutil.serialization.XML
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.Credentials
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.asRequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import org.example.file.NextcloudFile
-import org.example.file.executeSqlQuery
-import org.example.file.remoteToBasePath
-import org.example.xml.propfind.MultiStatus
+import org.file.NextcloudFile
+import org.file.executeSqlQuery
+import org.file.remoteToBasePath
+import org.xml.propfind.MultiStatus
 import java.io.File
 import java.io.FileOutputStream
-import java.io.IOException
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.sql.Connection
 import java.sql.DriverManager
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Base64
 import kotlin.Long
 import kotlin.String
 import kotlin.collections.forEach
@@ -45,7 +40,6 @@ class NextcloudDAV(
     var requestOnGoing = false
     private val remoteUrl = "$baseUrl/remote.php/dav/files/$username"
 
-    private val client = OkHttpClient()
     private val semaphore = Semaphore(10)
     private var captured: Long = 0
 
@@ -53,9 +47,14 @@ class NextcloudDAV(
     private val dbFile = File("$localPath/.nextcloud-dav-sync.db")
     private val dbConnection: Connection = DriverManager.getConnection("jdbc:sqlite:$dbFile")
 
+    private val auth = "$username:$password"
+    private val encodedAuth = Base64.getEncoder().encodeToString(auth.toByteArray())
+    private val authHeader = "Basic $encodedAuth"
+
     fun updateRemoteFileList() {
         requestOnGoing = true
-        val propFindRequestBody =
+
+        val xmlBody =
             """
             <?xml version="1.0" encoding="UTF-8"?>
             <d:propfind  xmlns:d="DAV:">
@@ -67,42 +66,37 @@ class NextcloudDAV(
                     <d:resourcetype/>
                 </d:prop>
             </d:propfind>
-            """.trimIndent().toRequestBody("application/xml".toMediaType())
+            """.trimIndent()
+
+        val client = HttpClient.newHttpClient()
 
         val request =
-            Request
-                .Builder()
-                .url(remoteUrl)
-                .method("PROPFIND", propFindRequestBody)
+            HttpRequest
+                .newBuilder()
+                .uri(URI.create(remoteUrl))
+                .method("PROPFIND", HttpRequest.BodyPublishers.ofString(xmlBody))
                 .header("Depth", "10")
-                .header("Authorization", Credentials.basic(username, password))
+                .header("Authorization", authHeader)
+                .header("Content-Type", "application/xml")
                 .build()
 
-        client.newCall(request).enqueue(
-            object : Callback {
-                override fun onFailure(
-                    call: Call,
-                    e: IOException,
-                ) {
-                    println("Failed: ${e.message}")
-                }
-
-                override fun onResponse(
-                    call: Call,
-                    response: Response,
-                ) {
-                    val responseBody = response.body?.string()
-                    if (response.isSuccessful && responseBody != null) {
-                        deserializePropFindReq(
-                            xmlBody = responseBody,
-                        )
-                    } else {
-                        println("Error: ${response.code}")
+        client
+            .sendAsync(request, HttpResponse.BodyHandlers.ofString())
+            .thenApply { response ->
+                if (response.statusCode() in 200..299) {
+                    val body = response.body()
+                    if (body != null) {
+                        deserializePropFindReq(body)
                     }
-                    requestOnGoing = false
+                } else {
+                    println("Error: ${response.statusCode()}")
                 }
-            },
-        )
+                requestOnGoing = false
+            }.exceptionally { ex ->
+                println("Failed: ${ex.message}")
+                requestOnGoing = false
+                null
+            }
     }
 
     fun deserializePropFindReq(xmlBody: String) {
@@ -486,28 +480,33 @@ class NextcloudDAV(
                 WHERE path = ?
                 """.trimIndent()
 
-            val request =
-                Request
-                    .Builder()
-                    .url(remoteFileUrl)
-                    .put(localFile.asRequestBody("application/octet-stream".toMediaType()))
-                    .header("Authorization", Credentials.basic(username, password))
-                    .header("X-OC-MTime", (localFile.lastModified() / 1000).toString())
-                    .build()
-
             dbConnection.prepareStatement(sqlString).use { stmt ->
                 dbConnection.autoCommit = false
                 try {
                     println("try uploading $remoteFileUrl")
-                    client.newCall(request).execute().use { response ->
-                        if (!response.isSuccessful) {
-                            println("Failed to upload ${localFile.name}: ${response.code} ${response.message}")
-                        } else {
-                            println("Uploaded ${localFile.name} with mtime ${(localFile.lastModified() / 1000L) * 1000L}")
-                            stmt.setLong(1, (localFile.lastModified() / 1000L) * 1000L)
-                            stmt.setString(2, localFile.relativeTo(File(localPath)).toString())
-                            stmt.addBatch()
-                        }
+
+                    val client = HttpClient.newHttpClient()
+
+                    val request =
+                        HttpRequest
+                            .newBuilder()
+                            .uri(URI.create(remoteFileUrl))
+                            .header("Authorization", authHeader)
+                            .header("Content-Type", "application/octet-stream") // or "text/plain", "application/xml", etc., as needed
+                            .header("X-OC-MTime", (localFile.lastModified() / 1000L * 1000L).toString())
+                            .PUT(HttpRequest.BodyPublishers.ofFile(localFile.toPath()))
+                            .build()
+
+                    val response = client.send(request, HttpResponse.BodyHandlers.discarding())
+
+                    if (response.statusCode() !in 200..299) {
+                        println("Failed to upload ${localFile.name}: ${response.statusCode()} ${response.body()}")
+                    } else {
+                        val modTime = (localFile.lastModified() / 1000L) * 1000L
+                        println("Uploaded ${localFile.name} with mtime $modTime")
+                        stmt.setLong(1, modTime)
+                        stmt.setString(2, localFile.relativeTo(File(localPath)).toString())
+                        stmt.addBatch()
                     }
                 } catch (e: Exception) {
                     println("Error uploading $remoteFileUrl: ${e.message}")
@@ -534,44 +533,47 @@ class NextcloudDAV(
                 WHERE path = ?
                 """.trimIndent()
 
-            val request =
-                Request
-                    .Builder()
-                    .url(fileUri)
-                    .header("Authorization", Credentials.basic(username, password))
-                    .get()
-                    .build()
-
             dbConnection.prepareStatement(sqlString).use { stmt ->
                 dbConnection.autoCommit = false
                 try {
-                    client.newCall(request).execute().use { response ->
-                        if (!response.isSuccessful) {
-                            println("Failed to download $fileUri: ${response.code}")
-                        }
-                        val body = response.body
-                        if (body != null) {
-                            val localFile = File(localFilePath)
-                            localFile.parentFile?.mkdirs()
+                    val client = HttpClient.newHttpClient()
 
-                            FileOutputStream(localFile).use { outputStream ->
-                                body.byteStream().use { inputStream ->
-                                    inputStream.copyTo(outputStream)
-                                }
-                            }
-                            localFile.setLastModified(lastModifiedTime)
-                            println("Downloaded $fileUri to $localFilePath")
-                            if (localFile.exists()) {
-                                stmt.setLong(1, lastModifiedTime)
-                                stmt.setString(2, localFile.relativeTo(File(localPath)).toString())
-                                stmt.addBatch()
-                                println("Test ${localFile.relativeTo(File(localPath))}")
-                            }
-                        }
+                    val request =
+                        HttpRequest
+                            .newBuilder()
+                            .uri(URI.create(fileUri))
+                            .header("Authorization", authHeader)
+                            .GET()
+                            .build()
+
+                    val response = client.send(request, HttpResponse.BodyHandlers.ofInputStream())
+
+                    if (response.statusCode() !in 200..299) {
+                        println("Failed to download $fileUri: ${response.statusCode()}")
+                        return
+                    }
+
+                    val inputStream = response.body()
+                    val localFile = File(localFilePath)
+                    localFile.parentFile?.mkdirs()
+
+                    FileOutputStream(localFile).use { outputStream ->
+                        inputStream.use { it.copyTo(outputStream) }
+                    }
+
+                    localFile.setLastModified(lastModifiedTime)
+                    println("Downloaded $fileUri to $localFilePath")
+
+                    if (localFile.exists()) {
+                        stmt.setLong(1, lastModifiedTime)
+                        stmt.setString(2, localFile.relativeTo(File(localPath)).toString())
+                        stmt.addBatch()
+                        println("Test ${localFile.relativeTo(File(localPath))}")
                     }
                 } catch (e: Exception) {
                     println("Error downloading $fileUri: ${e.message}")
                 }
+
                 stmt.executeBatch()
                 dbConnection.commit()
                 dbConnection.autoCommit = true
@@ -587,24 +589,27 @@ class NextcloudDAV(
             """.trimIndent()
 
         semaphore.withPermit {
-            val request =
-                Request
-                    .Builder()
-                    .url(fileUri)
-                    .header("Authorization", Credentials.basic(username, password))
-                    .delete()
-                    .build()
             dbConnection.prepareStatement(sqlString).use { stmt ->
                 dbConnection.autoCommit = false
                 try {
-                    client.newCall(request).execute().use { response ->
-                        if (!response.isSuccessful) {
-                            println("Failed to delete $fileUri: ${response.code}")
-                        } else {
-                            println("File $fileUri deleted on Remote.")
-                            stmt.setString(1, remoteToBasePath(fileUri))
-                            stmt.addBatch()
-                        }
+                    val client = HttpClient.newHttpClient()
+
+                    val request =
+                        HttpRequest
+                            .newBuilder()
+                            .uri(URI.create(fileUri))
+                            .header("Authorization", authHeader)
+                            .DELETE()
+                            .build()
+
+                    val response = client.send(request, HttpResponse.BodyHandlers.discarding())
+
+                    if (response.statusCode() !in 200..299) {
+                        println("Failed to delete $fileUri: ${response.statusCode()}")
+                    } else {
+                        println("File $fileUri deleted on Remote.")
+                        stmt.setString(1, remoteToBasePath(fileUri))
+                        stmt.addBatch()
                     }
                 } catch (e: Exception) {
                     println("Error delete $fileUri: ${e.message}")
